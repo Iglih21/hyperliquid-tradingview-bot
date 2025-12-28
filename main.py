@@ -5,31 +5,20 @@ from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
-# =========================
-# ENVIRONMENT VARIABLES
-# =========================
-PRIVATE_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]     # API Wallet Private Key
-ACCOUNT_ADDRESS = os.environ["HYPERLIQUID_WALLET"]    # Main Hyperliquid account address
+# ======================
+# ENV
+# ======================
+PRIVATE_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
+ACCOUNT_ADDRESS = os.environ["HYPERLIQUID_WALLET"]
 
 DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", 10))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.04))
 
-# =========================
-# WALLET + CLIENT
-# =========================
-wallet = Account.from_key(PRIVATE_KEY)
-
-client = Exchange(
-    wallet=wallet,
-    base_url=constants.MAINNET_API_URL,
-    account_address=ACCOUNT_ADDRESS
-)
-
 app = FastAPI()
 
-# =========================
-# WEBHOOK MODEL
-# =========================
+# ======================
+# MODEL
+# ======================
 class WebhookSignal(BaseModel):
     action: str
     coin: str
@@ -37,72 +26,78 @@ class WebhookSignal(BaseModel):
     risk_pct: float = MAX_RISK_PCT
     mode: str = "reverse"
 
-# =========================
-# HELPER FUNCTIONS
-# =========================
-def get_available_balance():
-    state = client.info.user_state(ACCOUNT_ADDRESS)
+# ======================
+# LAZY CLIENT
+# ======================
+client = None
 
-    # Hyperliquid returns cross margin collateral here
-    balance = float(state["marginSummary"]["accountValue"])
-    return balance
+def get_client():
+    global client
+    if client is None:
+        wallet = Account.from_key(PRIVATE_KEY)
+        client = Exchange(
+            wallet=wallet,
+            base_url=constants.MAINNET_API_URL,
+            account_address=ACCOUNT_ADDRESS
+        )
+    return client
 
-def get_price(symbol):
-    book = client.info.l2_snapshot(symbol)
-    best_bid = float(book["levels"][0][0]["px"])
-    best_ask = float(book["levels"][1][0]["px"])
-    return (best_bid + best_ask) / 2
+# ======================
+# HELPERS
+# ======================
+def get_balance(c):
+    state = c.info.user_state(ACCOUNT_ADDRESS)
+    return float(state["marginSummary"]["accountValue"])
 
-def get_open_position(symbol):
-    state = client.info.user_state(ACCOUNT_ADDRESS)
+def get_price(c, symbol):
+    book = c.info.l2_snapshot(symbol)
+    bid = float(book["levels"][0][0]["px"])
+    ask = float(book["levels"][1][0]["px"])
+    return (bid + ask) / 2
+
+def get_position(c, symbol):
+    state = c.info.user_state(ACCOUNT_ADDRESS)
     for pos in state["positions"]:
         if pos["coin"] == symbol:
-            size = float(pos["szi"])
-            if size != 0:
+            if float(pos["szi"]) != 0:
                 return pos
     return None
 
-# =========================
+# ======================
 # WEBHOOK
-# =========================
+# ======================
 @app.post("/webhook")
 async def webhook(signal: WebhookSignal):
+    c = get_client()
 
     action = signal.action.upper()
     if action not in ["BUY", "SELL"]:
         raise HTTPException(400, "Invalid action")
 
-    coin = signal.coin.upper()
-    symbol = coin
+    symbol = signal.coin.upper()
+    leverage = signal.leverage
+    risk = min(signal.risk_pct, MAX_RISK_PCT)
 
-    leverage = signal.leverage or DEFAULT_LEVERAGE
-    risk_pct = min(signal.risk_pct or MAX_RISK_PCT, MAX_RISK_PCT)
-
-    # Balance
-    balance = get_available_balance()
+    balance = get_balance(c)
     if balance <= 0:
-        raise HTTPException(400, "No balance")
+        raise HTTPException(400, "No funds")
 
-    # Price
-    price = get_price(symbol)
+    price = get_price(c, symbol)
+    usd = balance * risk * leverage
+    size = usd / price
 
-    # Exposure
-    usd_size = balance * risk_pct * leverage
-    size = usd_size / price
+    pos = get_position(c, symbol)
 
-    # Existing position
-    pos = get_open_position(symbol)
-
-    # Close opposite if needed
+    # close opposite
     if pos:
         side = "B" if float(pos["szi"]) < 0 else "S"
         if (action == "BUY" and side == "S") or (action == "SELL" and side == "B"):
-            client.order(symbol, side, abs(float(pos["szi"])), {"reduceOnly": True})
+            c.order(symbol, side, abs(float(pos["szi"])), {"reduceOnly": True})
 
-    # Open new
+    # open new
     side = "B" if action == "BUY" else "S"
 
-    client.order(
+    c.order(
         symbol,
         side,
         size,
@@ -114,10 +109,9 @@ async def webhook(signal: WebhookSignal):
     )
 
     return {
-        "status": "executed",
-        "action": action,
+        "status": "ok",
         "symbol": symbol,
-        "usd_size": usd_size,
-        "size": size,
-        "leverage": leverage
+        "side": side,
+        "usd": usd,
+        "size": size
     }
