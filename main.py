@@ -1,23 +1,29 @@
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import hyperliquid
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
 
+# Load environment variables
 HYPERLIQUID_AGENT_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
 HYPERLIQUID_WALLET = os.environ["HYPERLIQUID_WALLET"]
 DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", 10))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.04))
 
-# Initialize hyperliquid client
-client = hyperliquid.Client(wallet_address=HYPERLIQUID_WALLET, agent_key=HYPERLIQUID_AGENT_KEY)
+# Initialize Hyperliquid Exchange
+client = Exchange(
+    HYPERLIQUID_AGENT_KEY,
+    HYPERLIQUID_WALLET,
+    constants.MAINNET_API_URL
+)
 
 app = FastAPI()
 
 class WebhookSignal(BaseModel):
     action: str
     coin: str
-    leverage: float = DEFAULT_LEVERAGE
-    risk_pct: float = MAX_RISK_PCT
+    leverage: float | None = None
+    risk_pct: float | None = None
     mode: str = "reverse"
 
 @app.post("/webhook")
@@ -27,55 +33,47 @@ async def handle_webhook(signal: WebhookSignal):
         raise HTTPException(status_code=400, detail="Invalid action")
 
     coin = signal.coin.upper()
-    pair = f"{coin}-USDC"
-    leverage = signal.leverage or DEFAULT_LEVERAGE
-    risk_pct = min(signal.risk_pct or MAX_RISK_PCT, MAX_RISK_PCT)
+    symbol = f"{coin}-USDC"
 
-    # Fetch account info for available balance
-    account_info = client.get_account_overview()
-    # Use freeCollateral as available balance (in USDC)
-    balance = float(account_info.get("freeCollateral", 0))
+    leverage = signal.leverage if signal.leverage else DEFAULT_LEVERAGE
+    risk_pct = min(signal.risk_pct if signal.risk_pct else MAX_RISK_PCT, MAX_RISK_PCT)
 
-    if balance <= 0:
+    # Fetch account state
+    account = client.info.user_state(HYPERLIQUID_WALLET)
+    balance = float(account["crossMarginSummary"]["availableBalance"])
+
+    if balance <= 1:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    # Fetch mark price for the trading pair
-    ticker = client.get_ticker(pair)
-    price = float(ticker.get("markPrice"))
+    # Fetch mid price
+    mids = client.info.all_mids()
+    price = float(mids[symbol])
 
-    # Calculate position size in base units
+    # Calculate USD exposure
     usd_exposure = balance * risk_pct * leverage
-    quantity = usd_exposure / price
+    size = usd_exposure / price
 
-    # Check existing positions
-    open_positions = client.get_open_positions()
-    for pos in open_positions:
-        if pos.get("symbol") == pair:
-            pos_side = pos.get("side")
-            pos_size = float(pos.get("size"))
-            if (action == "BUY" and pos_side == "short") or (action == "SELL" and pos_side == "long"):
-                # Close the opposite position
-                close_side = "buy" if pos_side == "short" else "sell"
-                client.place_order(
-                    symbol=pair,
-                    side=close_side,
-                    quantity=pos_size,
-                    order_type="market",
-                    reduce_only=True,
-                    leverage=leverage,
-                    isolated=True,
-                )
+    # Fetch open positions
+    positions = account["assetPositions"]
+    for pos in positions:
+        if pos["position"]["coin"] == coin:
+            pos_size = float(pos["position"]["szi"])
+            if pos_size != 0:
+                is_long = pos_size > 0
+                if (action == "BUY" and not is_long) or (action == "SELL" and is_long):
+                    # Close opposite side
+                    client.exchange.market_close(coin)
 
-    # Place new order
-    order_side = "buy" if action == "BUY" else "sell"
-    client.place_order(
-        symbol=pair,
-        side=order_side,
-        quantity=quantity,
-        order_type="market",
-        reduce_only=False,
-        leverage=leverage,
-        isolated=True,
-    )
+    # Open new position
+    if action == "BUY":
+        client.exchange.market_open(coin, True, size, leverage)
+    else:
+        client.exchange.market_open(coin, False, size, leverage)
 
-    return {"status": "order placed", "side": order_side, "quantity": quantity}
+    return {
+        "status": "executed",
+        "coin": coin,
+        "side": action,
+        "usd_exposure": usd_exposure,
+        "size": size
+    }
