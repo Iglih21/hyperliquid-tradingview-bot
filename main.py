@@ -1,35 +1,34 @@
 import os
+import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
-
-# ===========================
-# ENVIRONMENT
-# ===========================
 
 WALLET = os.environ["HYPERLIQUID_WALLET"]
 AGENT_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
 
 DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", 2))
-MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.01))
+MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.02))
 
 BASE_URL = constants.MAINNET_API_URL
 
-# ===========================
-# FASTAPI
-# ===========================
-
 app = FastAPI()
-
-# ===========================
-# SINGLETON CLIENTS (NO WS)
-# ===========================
 
 _info = None
 _exchange = None
+_last_info_fetch = 0
+_cached_state = None
+_cached_mids = None
+
+RATE_LIMIT_COOLDOWN = 5  # seconds
+
+class Signal(BaseModel):
+    action: str
+    coin: str
+    leverage: float = DEFAULT_LEVERAGE
+    risk_pct: float = MAX_RISK_PCT
 
 def get_info():
     global _info
@@ -43,42 +42,38 @@ def get_exchange():
         _exchange = Exchange(BASE_URL, WALLET, AGENT_KEY, skip_ws=True)
     return _exchange
 
-# ===========================
-# MODELS
-# ===========================
+def refresh_state():
+    global _cached_state, _cached_mids, _last_info_fetch
 
-class Signal(BaseModel):
-    action: str
-    coin: str
-    leverage: float = DEFAULT_LEVERAGE
-    risk_pct: float = MAX_RISK_PCT
+    now = time.time()
+    if now - _last_info_fetch < 2:
+        return
 
-# ===========================
-# HELPERS
-# ===========================
-
-def get_state():
-    return get_info().user_state(WALLET)
+    try:
+        info = get_info()
+        _cached_state = info.user_state(WALLET)
+        _cached_mids = info.all_mids()
+        _last_info_fetch = now
+    except Exception as e:
+        if "429" in str(e):
+            time.sleep(RATE_LIMIT_COOLDOWN)
+        raise
 
 def get_balance():
-    state = get_state()
-    return float(state["marginSummary"]["accountValue"])
+    refresh_state()
+    return float(_cached_state["marginSummary"]["accountValue"])
 
 def get_position(symbol):
-    state = get_state()
-    for p in state.get("assetPositions", []):
+    refresh_state()
+    for p in _cached_state.get("assetPositions", []):
         pos = p["position"]
         if pos["coin"] == symbol:
             return float(pos["szi"])
     return 0.0
 
 def get_price(symbol):
-    mids = get_info().all_mids()
-    return float(mids[symbol])
-
-# ===========================
-# WEBHOOK
-# ===========================
+    refresh_state()
+    return float(_cached_mids[symbol])
 
 @app.post("/webhook")
 def webhook(signal: Signal):
@@ -106,15 +101,11 @@ def webhook(signal: Signal):
         exchange = get_exchange()
         pos = get_position(symbol)
 
-        # Close opposite side
         if pos != 0:
             if (pos > 0 and side == "SELL") or (pos < 0 and side == "BUY"):
                 exchange.market_close(symbol)
 
-        # Set leverage
         exchange.update_leverage(symbol, leverage)
-
-        # Open new position
         exchange.market_open(symbol, side == "BUY", size)
 
         return {
@@ -127,4 +118,6 @@ def webhook(signal: Signal):
         }
 
     except Exception as e:
+        if "429" in str(e):
+            raise HTTPException(429, "Hyperliquid rate limited. Try again in 10 seconds.")
         raise HTTPException(500, str(e))
