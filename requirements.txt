@@ -1,4 +1,4 @@
 fastapi
 uvicorn
 requests
-git+https://github.com/hyperliquid-dex/hyperliquid-python.git
+hyperliquid @ git+https://github.com/hyperliquid-dex/hyperliquid-python.git
