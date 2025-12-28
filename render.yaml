@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: hyperliquid-tradingview-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: HYPERLIQUID_AGENT_KEY
+        sync: false
+      - key: HYPERLIQUID_WALLET
+        sync: false
+      - key: DEFAULT_LEVERAGE
+        sync: false
+      - key: MAX_RISK_PCT
+        sync: false
