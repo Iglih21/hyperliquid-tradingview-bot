@@ -2,19 +2,17 @@ import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from hyperliquid.exchange import Exchange
-
-BASE_URL = "https://api.hyperliquid.xyz"
+from hyperliquid.utils import constants
 
 PRIVATE_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
 WALLET = os.environ["HYPERLIQUID_WALLET"]
 DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", 10))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.04))
 
-# Correct initialization for xiangyu SDK
 client = Exchange(
-    BASE_URL,
+    PRIVATE_KEY,
     WALLET,
-    PRIVATE_KEY
+    constants.MAINNET_API_URL
 )
 
 app = FastAPI()
@@ -34,43 +32,56 @@ async def webhook(signal: WebhookSignal):
             raise HTTPException(400, "Invalid action")
 
         coin = signal.coin.upper()
-        symbol = f"{coin}-USDC"
+        pair = f"{coin}-USDC"
+
         leverage = signal.leverage
         risk_pct = min(signal.risk_pct, MAX_RISK_PCT)
 
-        # Fetch state
-        state = client.info.user_state(WALLET)
-        free = float(state["crossMarginSummary"]["freeCollateral"])
+        state = client.get_account_overview()
+        balance = float(state["freeCollateral"])
 
-        if free <= 0:
+        if balance <= 0:
             raise HTTPException(400, "No free collateral")
 
-        # Price
-        mids = client.info.all_mids()
-        price = float(mids[symbol])
+        ticker = client.get_ticker(pair)
+        price = float(ticker["markPrice"])
 
-        usd = free * risk_pct * leverage
+        usd = balance * risk_pct * leverage
         size = round(usd / price, 4)
 
-        # Close opposite positions (reverse mode)
-        for p in state.get("assetPositions", []):
-            if p["position"]["coin"] == coin:
-                szi = float(p["position"]["szi"])
-                if (szi > 0 and side == "SELL") or (szi < 0 and side == "BUY"):
-                    client.market_close(symbol)
+        # Close opposite
+        for pos in client.get_open_positions():
+            if pos["symbol"] == pair:
+                if (pos["side"] == "long" and side == "SELL") or (pos["side"] == "short" and side == "BUY"):
+                    client.place_order(
+                        symbol=pair,
+                        side="sell" if pos["side"] == "long" else "buy",
+                        quantity=float(pos["size"]),
+                        order_type="market",
+                        reduce_only=True,
+                        leverage=leverage,
+                        isolated=True
+                    )
 
-        # Place order
-        is_buy = side == "BUY"
-        client.order(symbol, is_buy, size, {"market": {}}, False)
+        order_side = "buy" if side == "BUY" else "sell"
+
+        client.place_order(
+            symbol=pair,
+            side=order_side,
+            quantity=size,
+            order_type="market",
+            reduce_only=False,
+            leverage=leverage,
+            isolated=True
+        )
 
         return {
             "status": "executed",
-            "symbol": symbol,
+            "symbol": pair,
             "side": side,
             "size": size,
             "usd_used": usd,
-            "price": price,
-            "free_collateral": free
+            "price": price
         }
 
     except Exception as e:
