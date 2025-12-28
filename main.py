@@ -1,121 +1,100 @@
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from eth_account import Account
-from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
+from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
-# =========================
-# ENVIRONMENT
-# =========================
-PRIVATE_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
+# ============================
+# ENV
+# ============================
 WALLET = os.environ["HYPERLIQUID_WALLET"]
-DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", 10))
-MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.04))
+AGENT_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
+DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", 2))
+MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.01))
 
 BASE_URL = constants.MAINNET_API_URL
 
-# =========================
-# INIT HYPERLIQUID
-# =========================
-wallet = Account.from_key(PRIVATE_KEY)
-
-exchange = Exchange(
-    wallet=wallet,
-    base_url=BASE_URL,
-    account_address=WALLET,
-)
-
 info = Info(BASE_URL)
+exchange = Exchange(AGENT_KEY, WALLET, BASE_URL)
 
-# =========================
-# FASTAPI
-# =========================
 app = FastAPI()
 
+# ============================
+# Webhook schema
+# ============================
 class Signal(BaseModel):
     action: str
     coin: str
-    leverage: float | None = None
-    risk_pct: float | None = None
-    mode: str = "reverse"
+    leverage: float = DEFAULT_LEVERAGE
+    risk_pct: float = MAX_RISK_PCT
 
-# =========================
-# HELPERS
-# =========================
+
+# ============================
+# Helpers
+# ============================
+def get_state():
+    return info.user_state(WALLET)
 
 def get_balance():
-    state = info.user_state(WALLET)
-    return float(state["marginSummary"]["availableBalance"])
+    state = get_state()
+    return float(state["marginSummary"]["accountValue"])
 
 def get_position(symbol):
-    state = info.user_state(WALLET)
-    for p in state["assetPositions"]:
+    state = get_state()
+    for p in state.get("assetPositions", []):
         pos = p["position"]
         if pos["coin"] == symbol:
-            return pos
-    return None
+            return float(pos["szi"])
+    return 0.0
 
-def market_order(symbol, is_buy, size, reduce_only=False):
-    exchange.order(
-        symbol,
-        is_buy,
-        size,
-        None,
-        {
-            "market": {}
-        },
-        reduce_only=reduce_only
-    )
+def get_price(symbol):
+    mids = info.all_mids()
+    return float(mids[symbol])
 
-# =========================
-# WEBHOOK
-# =========================
 
+# ============================
+# Webhook
+# ============================
 @app.post("/webhook")
 def webhook(signal: Signal):
+    try:
+        symbol = signal.coin.upper()
+        side = signal.action.upper()
 
-    action = signal.action.upper()
-    if action not in ["BUY", "SELL"]:
-        raise HTTPException(400, "Invalid action")
+        if side not in ["BUY", "SELL"]:
+            raise HTTPException(400, "action must be BUY or SELL")
 
-    coin = signal.coin.upper()
-    leverage = signal.leverage or DEFAULT_LEVERAGE
-    risk_pct = min(signal.risk_pct or MAX_RISK_PCT, MAX_RISK_PCT)
+        leverage = float(signal.leverage)
+        risk_pct = min(float(signal.risk_pct), MAX_RISK_PCT)
 
-    # Balance
-    balance = get_balance()
-    if balance <= 0:
-        raise HTTPException(400, "No available balance")
+        balance = get_balance()
+        price = get_price(symbol)
 
-    # Price
-    price = float(info.all_mids()[coin])
+        usd_risk = balance * risk_pct
+        size = round((usd_risk * leverage) / price, 4)
 
-    # Exposure
-    usd = balance * risk_pct * leverage
-    size = round(usd / price, 4)
+        pos = get_position(symbol)
 
-    # Existing position
-    pos = get_position(coin)
+        # Flip if opposite
+        if pos != 0:
+            if (pos > 0 and side == "SELL") or (pos < 0 and side == "BUY"):
+                exchange.market_close(symbol)
 
-    # Close opposite if exists
-    if pos:
-        pos_size = float(pos["szi"])
-        if action == "BUY" and pos_size < 0:
-            market_order(coin, True, abs(pos_size), True)
-        if action == "SELL" and pos_size > 0:
-            market_order(coin, False, abs(pos_size), True)
+        # Set leverage
+        exchange.update_leverage(symbol, leverage)
 
-    # Open new
-    if action == "BUY":
-        market_order(coin, True, size, False)
-    else:
-        market_order(coin, False, size, False)
+        # Place order
+        exchange.market_open(symbol, side == "BUY", size)
 
-    return {
-        "status": "executed",
-        "symbol": coin,
-        "side": action,
-        "size": size
-    }
+        return {
+            "status": "executed",
+            "symbol": symbol,
+            "side": side,
+            "size": size,
+            "price": price,
+            "account_value": balance
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
