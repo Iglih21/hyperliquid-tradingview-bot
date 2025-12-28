@@ -5,9 +5,6 @@ from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
-# =========================
-# ENV
-# =========================
 WALLET = os.environ["HYPERLIQUID_WALLET"]
 AGENT_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
 
@@ -16,15 +13,25 @@ MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.01))
 
 BASE_URL = constants.MAINNET_API_URL
 
-# Correct xiangyu constructors
-info = Info(BASE_URL)
-exchange = Exchange(BASE_URL, WALLET, AGENT_KEY)
-
 app = FastAPI()
 
-# =========================
-# Webhook schema
-# =========================
+# Lazy singletons
+_info = None
+_exchange = None
+
+def get_info():
+    global _info
+    if _info is None:
+        _info = Info(BASE_URL)
+    return _info
+
+def get_exchange():
+    global _exchange
+    if _exchange is None:
+        _exchange = Exchange(BASE_URL, WALLET, AGENT_KEY)
+    return _exchange
+
+
 class Signal(BaseModel):
     action: str
     coin: str
@@ -32,11 +39,8 @@ class Signal(BaseModel):
     risk_pct: float = MAX_RISK_PCT
 
 
-# =========================
-# Helpers
-# =========================
 def get_state():
-    return info.user_state(WALLET)
+    return get_info().user_state(WALLET)
 
 def get_balance():
     state = get_state()
@@ -51,13 +55,10 @@ def get_position(symbol):
     return 0.0
 
 def get_price(symbol):
-    mids = info.all_mids()
+    mids = get_info().all_mids()
     return float(mids[symbol])
 
 
-# =========================
-# Webhook
-# =========================
 @app.post("/webhook")
 def webhook(signal: Signal):
     try:
@@ -77,16 +78,13 @@ def webhook(signal: Signal):
         size = round((usd_risk * leverage) / price, 4)
 
         pos = get_position(symbol)
+        exchange = get_exchange()
 
-        # Close opposite position
         if pos != 0:
             if (pos > 0 and side == "SELL") or (pos < 0 and side == "BUY"):
                 exchange.market_close(symbol)
 
-        # Set leverage
         exchange.update_leverage(symbol, leverage)
-
-        # Open position
         exchange.market_open(symbol, side == "BUY", size)
 
         return {
