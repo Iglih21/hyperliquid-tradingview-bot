@@ -13,66 +13,82 @@ MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.04))
 # Initialize Hyperliquid Exchange
 client = Exchange(
     HYPERLIQUID_AGENT_KEY,
+    HYPERLIQUID_WALLET,
     constants.MAINNET_API_URL
 )
 
 app = FastAPI()
 
+# Incoming TradingView webhook schema
 class WebhookSignal(BaseModel):
     action: str
     coin: str
-    leverage: float | None = None
-    risk_pct: float | None = None
-    mode: str = "reverse"
+    leverage: float = DEFAULT_LEVERAGE
+    risk_pct: float = MAX_RISK_PCT
+    mode: str = "reverse"   # reverse = auto close opposite positions
+
 
 @app.post("/webhook")
 async def handle_webhook(signal: WebhookSignal):
-    action = signal.action.upper()
-    if action not in ("BUY", "SELL"):
-        raise HTTPException(status_code=400, detail="Invalid action")
+    try:
+        action = signal.action.upper()
+        if action not in ("BUY", "SELL"):
+            raise HTTPException(status_code=400, detail="Invalid action")
 
-    coin = signal.coin.upper()
+        coin = signal.coin.upper()
+        symbol = f"{coin}-USDC"
+        leverage = signal.leverage
+        risk_pct = min(signal.risk_pct, MAX_RISK_PCT)
 
-    leverage = signal.leverage if signal.leverage else DEFAULT_LEVERAGE
-    risk_pct = min(signal.risk_pct if signal.risk_pct else MAX_RISK_PCT, MAX_RISK_PCT)
+        # Fetch account state
+        state = client.info.user_state(HYPERLIQUID_WALLET)
 
-    # Get account state
-    state = client.info.user_state(HYPERLIQUID_WALLET)
-    balance = float(state["crossMarginSummary"]["availableBalance"])
+        # This is the ONLY tradable balance on Hyperliquid
+        balance = float(state["crossMarginSummary"]["freeCollateral"])
 
-    if balance <= 1:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
+        if balance <= 1:
+            raise HTTPException(status_code=400, detail="No free collateral")
 
-    # Get current price
-    mids = client.info.all_mids()
-    if coin not in mids:
-        raise HTTPException(status_code=400, detail=f"{coin} not supported")
+        # Get mark price
+        prices = client.info.all_mids()
+        price = float(prices[symbol])
 
-    price = float(mids[coin])
+        # USD exposure
+        usd_exposure = balance * risk_pct * leverage
 
-    # Calculate size
-    usd_exposure = balance * risk_pct * leverage
-    size = usd_exposure / price
+        # Contract size
+        quantity = round(usd_exposure / price, 4)
 
-    # Close opposite position if needed
-    for pos in state["assetPositions"]:
-        if pos["position"]["coin"] == coin:
-            pos_size = float(pos["position"]["szi"])
-            if pos_size != 0:
-                is_long = pos_size > 0
-                if (action == "BUY" and not is_long) or (action == "SELL" and is_long):
-                    client.exchange.market_close(coin)
+        # Get open positions
+        positions = state.get("assetPositions", [])
 
-    # Open new position
-    if action == "BUY":
-        client.exchange.market_open(coin, True, size, leverage)
-    else:
-        client.exchange.market_open(coin, False, size, leverage)
+        # Close opposite side if exists
+        for pos in positions:
+            if pos["position"]["coin"] == coin:
+                pos_size = float(pos["position"]["szi"])
+                if (pos_size > 0 and action == "SELL") or (pos_size < 0 and action == "BUY"):
+                    client.market_close(symbol)
 
-    return {
-        "status": "executed",
-        "coin": coin,
-        "side": action,
-        "usd_exposure": usd_exposure,
-        "size": size
-    }
+        # Place new order
+        is_buy = action == "BUY"
+
+        client.order(
+            symbol,
+            is_buy,
+            quantity,
+            {"market": {}},
+            reduce_only=False
+        )
+
+        return {
+            "status": "order placed",
+            "symbol": symbol,
+            "side": action,
+            "quantity": quantity,
+            "usd_used": usd_exposure,
+            "price": price,
+            "balance": balance
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
