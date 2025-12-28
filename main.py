@@ -2,93 +2,76 @@ import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from hyperliquid.exchange import Exchange
-from hyperliquid.utils import constants
 
-# Load environment variables
-HYPERLIQUID_AGENT_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
-HYPERLIQUID_WALLET = os.environ["HYPERLIQUID_WALLET"]
+BASE_URL = "https://api.hyperliquid.xyz"
+
+PRIVATE_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
+WALLET = os.environ["HYPERLIQUID_WALLET"]
 DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", 10))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.04))
 
-# Initialize Hyperliquid Exchange
+# Correct initialization for xiangyu SDK
 client = Exchange(
-    HYPERLIQUID_AGENT_KEY,
-    HYPERLIQUID_WALLET,
-    constants.MAINNET_API_URL
+    BASE_URL,
+    WALLET,
+    PRIVATE_KEY
 )
 
 app = FastAPI()
 
-# Incoming TradingView webhook schema
 class WebhookSignal(BaseModel):
     action: str
     coin: str
     leverage: float = DEFAULT_LEVERAGE
     risk_pct: float = MAX_RISK_PCT
-    mode: str = "reverse"   # reverse = auto close opposite positions
-
+    mode: str = "reverse"
 
 @app.post("/webhook")
-async def handle_webhook(signal: WebhookSignal):
+async def webhook(signal: WebhookSignal):
     try:
-        action = signal.action.upper()
-        if action not in ("BUY", "SELL"):
-            raise HTTPException(status_code=400, detail="Invalid action")
+        side = signal.action.upper()
+        if side not in ["BUY", "SELL"]:
+            raise HTTPException(400, "Invalid action")
 
         coin = signal.coin.upper()
         symbol = f"{coin}-USDC"
         leverage = signal.leverage
         risk_pct = min(signal.risk_pct, MAX_RISK_PCT)
 
-        # Fetch account state
-        state = client.info.user_state(HYPERLIQUID_WALLET)
+        # Fetch state
+        state = client.info.user_state(WALLET)
+        free = float(state["crossMarginSummary"]["freeCollateral"])
 
-        # This is the ONLY tradable balance on Hyperliquid
-        balance = float(state["crossMarginSummary"]["freeCollateral"])
+        if free <= 0:
+            raise HTTPException(400, "No free collateral")
 
-        if balance <= 1:
-            raise HTTPException(status_code=400, detail="No free collateral")
+        # Price
+        mids = client.info.all_mids()
+        price = float(mids[symbol])
 
-        # Get mark price
-        prices = client.info.all_mids()
-        price = float(prices[symbol])
+        usd = free * risk_pct * leverage
+        size = round(usd / price, 4)
 
-        # USD exposure
-        usd_exposure = balance * risk_pct * leverage
-
-        # Contract size
-        quantity = round(usd_exposure / price, 4)
-
-        # Get open positions
-        positions = state.get("assetPositions", [])
-
-        # Close opposite side if exists
-        for pos in positions:
-            if pos["position"]["coin"] == coin:
-                pos_size = float(pos["position"]["szi"])
-                if (pos_size > 0 and action == "SELL") or (pos_size < 0 and action == "BUY"):
+        # Close opposite positions (reverse mode)
+        for p in state.get("assetPositions", []):
+            if p["position"]["coin"] == coin:
+                szi = float(p["position"]["szi"])
+                if (szi > 0 and side == "SELL") or (szi < 0 and side == "BUY"):
                     client.market_close(symbol)
 
-        # Place new order
-        is_buy = action == "BUY"
-
-        client.order(
-            symbol,
-            is_buy,
-            quantity,
-            {"market": {}},
-            reduce_only=False
-        )
+        # Place order
+        is_buy = side == "BUY"
+        client.order(symbol, is_buy, size, {"market": {}}, False)
 
         return {
-            "status": "order placed",
+            "status": "executed",
             "symbol": symbol,
-            "side": action,
-            "quantity": quantity,
-            "usd_used": usd_exposure,
+            "side": side,
+            "size": size,
+            "usd_used": usd,
             "price": price,
-            "balance": balance
+            "free_collateral": free
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
