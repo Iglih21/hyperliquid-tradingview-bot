@@ -16,13 +16,8 @@ BASE_URL = constants.MAINNET_API_URL
 
 app = FastAPI()
 
-_info = None
-_exchange = None
-_last_info_fetch = 0
-_cached_state = None
-_cached_mids = None
-
-RATE_LIMIT_COOLDOWN = 5  # seconds
+info = Info(BASE_URL)
+exchange = Exchange(BASE_URL, WALLET, AGENT_KEY)
 
 class Signal(BaseModel):
     action: str
@@ -30,50 +25,21 @@ class Signal(BaseModel):
     leverage: float = DEFAULT_LEVERAGE
     risk_pct: float = MAX_RISK_PCT
 
-def get_info():
-    global _info
-    if _info is None:
-        _info = Info(BASE_URL, skip_ws=True)
-    return _info
-
-def get_exchange():
-    global _exchange
-    if _exchange is None:
-        _exchange = Exchange(BASE_URL, WALLET, AGENT_KEY, skip_ws=True)
-    return _exchange
-
-def refresh_state():
-    global _cached_state, _cached_mids, _last_info_fetch
-
-    now = time.time()
-    if now - _last_info_fetch < 2:
-        return
-
-    try:
-        info = get_info()
-        _cached_state = info.user_state(WALLET)
-        _cached_mids = info.all_mids()
-        _last_info_fetch = now
-    except Exception as e:
-        if "429" in str(e):
-            time.sleep(RATE_LIMIT_COOLDOWN)
-        raise
+def get_state():
+    return info.user_state(WALLET)
 
 def get_balance():
-    refresh_state()
-    return float(_cached_state["marginSummary"]["accountValue"])
+    return float(get_state()["marginSummary"]["accountValue"])
 
 def get_position(symbol):
-    refresh_state()
-    for p in _cached_state.get("assetPositions", []):
+    for p in get_state().get("assetPositions", []):
         pos = p["position"]
         if pos["coin"] == symbol:
             return float(pos["szi"])
     return 0.0
 
 def get_price(symbol):
-    refresh_state()
-    return float(_cached_mids[symbol])
+    return float(info.all_mids()[symbol])
 
 @app.post("/webhook")
 def webhook(signal: Signal):
@@ -91,14 +57,11 @@ def webhook(signal: Signal):
         price = get_price(symbol)
 
         usd_risk = balance * risk_pct
-        size = (usd_risk * leverage) / price
+        size = round((usd_risk * leverage) / price, 4)
 
         if size <= 0:
             raise HTTPException(400, "Calculated size is zero")
 
-        size = round(size, 4)
-
-        exchange = get_exchange()
         pos = get_position(symbol)
 
         if pos != 0:
@@ -118,6 +81,4 @@ def webhook(signal: Signal):
         }
 
     except Exception as e:
-        if "429" in str(e):
-            raise HTTPException(429, "Hyperliquid rate limited. Try again in 10 seconds.")
         raise HTTPException(500, str(e))
