@@ -13,7 +13,6 @@ MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.04))
 # Initialize Hyperliquid Exchange
 client = Exchange(
     HYPERLIQUID_AGENT_KEY,
-    HYPERLIQUID_WALLET,
     constants.MAINNET_API_URL
 )
 
@@ -33,35 +32,35 @@ async def handle_webhook(signal: WebhookSignal):
         raise HTTPException(status_code=400, detail="Invalid action")
 
     coin = signal.coin.upper()
-    symbol = f"{coin}-USDC"
 
     leverage = signal.leverage if signal.leverage else DEFAULT_LEVERAGE
     risk_pct = min(signal.risk_pct if signal.risk_pct else MAX_RISK_PCT, MAX_RISK_PCT)
 
-    # Fetch account state
-    account = client.info.user_state(HYPERLIQUID_WALLET)
-    balance = float(account["crossMarginSummary"]["availableBalance"])
+    # Get account state
+    state = client.info.user_state(HYPERLIQUID_WALLET)
+    balance = float(state["crossMarginSummary"]["availableBalance"])
 
     if balance <= 1:
         raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    # Fetch mid price
+    # Get current price
     mids = client.info.all_mids()
-    price = float(mids[symbol])
+    if coin not in mids:
+        raise HTTPException(status_code=400, detail=f"{coin} not supported")
 
-    # Calculate USD exposure
+    price = float(mids[coin])
+
+    # Calculate size
     usd_exposure = balance * risk_pct * leverage
     size = usd_exposure / price
 
-    # Fetch open positions
-    positions = account["assetPositions"]
-    for pos in positions:
+    # Close opposite position if needed
+    for pos in state["assetPositions"]:
         if pos["position"]["coin"] == coin:
             pos_size = float(pos["position"]["szi"])
             if pos_size != 0:
                 is_long = pos_size > 0
                 if (action == "BUY" and not is_long) or (action == "SELL" and is_long):
-                    # Close opposite side
                     client.exchange.market_close(coin)
 
     # Open new position
