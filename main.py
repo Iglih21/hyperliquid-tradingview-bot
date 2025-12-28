@@ -1,36 +1,64 @@
 import os
+import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
+# ==============================
+# ENV
+# ==============================
+
 WALLET = os.environ["HYPERLIQUID_WALLET"]
 AGENT_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
+
+BASE_URL = constants.MAINNET_API_URL
 
 DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", 2))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.01))
 
-BASE_URL = constants.MAINNET_API_URL
-
 app = FastAPI()
 
-# Lazy singletons
+# ==============================
+# Safe singletons
+# ==============================
+
 _info = None
 _exchange = None
+_last_init = 0
+
+def reset_clients():
+    global _info, _exchange
+    _info = None
+    _exchange = None
 
 def get_info():
-    global _info
-    if _info is None:
-        _info = Info(BASE_URL)
+    global _info, _last_init
+
+    # refresh every 5 minutes to avoid dead websocket
+    if _info is None or time.time() - _last_init > 300:
+        _info = Info(BASE_URL, skip_ws=True)
+        _last_init = time.time()
+
     return _info
 
 def get_exchange():
     global _exchange
+
     if _exchange is None:
-        _exchange = Exchange(BASE_URL, WALLET, AGENT_KEY)
+        _exchange = Exchange(
+            BASE_URL,
+            WALLET,
+            AGENT_KEY,
+            skip_ws=True   # 🚨 prevents Cloudflare ban
+        )
+
     return _exchange
 
+# ==============================
+# Models
+# ==============================
 
 class Signal(BaseModel):
     action: str
@@ -38,6 +66,9 @@ class Signal(BaseModel):
     leverage: float = DEFAULT_LEVERAGE
     risk_pct: float = MAX_RISK_PCT
 
+# ==============================
+# Helpers
+# ==============================
 
 def get_state():
     return get_info().user_state(WALLET)
@@ -58,6 +89,9 @@ def get_price(symbol):
     mids = get_info().all_mids()
     return float(mids[symbol])
 
+# ==============================
+# Webhook
+# ==============================
 
 @app.post("/webhook")
 def webhook(signal: Signal):
@@ -71,15 +105,19 @@ def webhook(signal: Signal):
         leverage = float(signal.leverage)
         risk_pct = min(float(signal.risk_pct), MAX_RISK_PCT)
 
-        balance = get_balance()
         price = get_price(symbol)
+        balance = get_balance()
 
         usd_risk = balance * risk_pct
-        size = round((usd_risk * leverage) / price, 4)
+        size = round((usd_risk * leverage) / price, 5)
+
+        if size <= 0:
+            raise HTTPException(400, "position size too small")
 
         pos = get_position(symbol)
         exchange = get_exchange()
 
+        # Close opposite side
         if pos != 0:
             if (pos > 0 and side == "SELL") or (pos < 0 and side == "BUY"):
                 exchange.market_close(symbol)
@@ -97,4 +135,5 @@ def webhook(signal: Signal):
         }
 
     except Exception as e:
+        reset_clients()
         raise HTTPException(500, str(e))
