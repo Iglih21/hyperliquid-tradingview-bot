@@ -5,24 +5,26 @@ from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
-# ============================
+# =========================
 # ENV
-# ============================
+# =========================
 WALLET = os.environ["HYPERLIQUID_WALLET"]
 AGENT_KEY = os.environ["HYPERLIQUID_AGENT_KEY"]
+
 DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", 2))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", 0.01))
 
 BASE_URL = constants.MAINNET_API_URL
 
+# Correct xiangyu constructors
 info = Info(BASE_URL)
-exchange = Exchange(AGENT_KEY, WALLET, BASE_URL)
+exchange = Exchange(BASE_URL, WALLET, AGENT_KEY)
 
 app = FastAPI()
 
-# ============================
+# =========================
 # Webhook schema
-# ============================
+# =========================
 class Signal(BaseModel):
     action: str
     coin: str
@@ -30,9 +32,9 @@ class Signal(BaseModel):
     risk_pct: float = MAX_RISK_PCT
 
 
-# ============================
+# =========================
 # Helpers
-# ============================
+# =========================
 def get_state():
     return info.user_state(WALLET)
 
@@ -53,9 +55,9 @@ def get_price(symbol):
     return float(mids[symbol])
 
 
-# ============================
+# =========================
 # Webhook
-# ============================
+# =========================
 @app.post("/webhook")
 def webhook(signal: Signal):
     try:
@@ -76,7 +78,7 @@ def webhook(signal: Signal):
 
         pos = get_position(symbol)
 
-        # Flip if opposite
+        # Close opposite position
         if pos != 0:
             if (pos > 0 and side == "SELL") or (pos < 0 and side == "BUY"):
                 exchange.market_close(symbol)
@@ -84,7 +86,7 @@ def webhook(signal: Signal):
         # Set leverage
         exchange.update_leverage(symbol, leverage)
 
-        # Place order
+        # Open position
         exchange.market_open(symbol, side == "BUY", size)
 
         return {
@@ -97,4 +99,4 @@ def webhook(signal: Signal):
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
